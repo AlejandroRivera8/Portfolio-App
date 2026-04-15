@@ -61,7 +61,7 @@ def validate_ticker_input(ticker_text):
 
 @st.cache_data(ttl=3600)
 def download_price_data(tickers, start_date, end_date):
-    all_tickers = list(dict.fromkeys(tickers + [BENCHMARK]))
+    all_tickers = list(dict.fromkeys(list(tickers) + [BENCHMARK]))
 
     try:
         raw = yf.download(
@@ -352,6 +352,7 @@ def risk_contribution(weights, cov_matrix_daily):
     return rc
 
 
+@st.cache_data(ttl=3600)
 def efficient_frontier_points(mean_daily_returns, cov_matrix_daily, n_points=40):
     n_assets = len(mean_daily_returns)
     bounds = tuple((0.0, 1.0) for _ in range(n_assets))
@@ -405,9 +406,11 @@ def get_lookback_options(returns_index):
     return ordered
 
 
+@st.cache_data(ttl=3600)
 def run_sensitivity_analysis(asset_returns_only, asset_names, rf_annual, lookback_options):
     results = []
     weights_rows = []
+    failed_windows = []
 
     for label, lookback_days in lookback_options.items():
         if lookback_days is None:
@@ -416,6 +419,7 @@ def run_sensitivity_analysis(asset_returns_only, asset_names, rf_annual, lookbac
             subset = asset_returns_only.tail(lookback_days).copy()
 
         if len(subset) < 60:
+            failed_windows.append(f"{label} (insufficient observations)")
             continue
 
         mean_daily_returns = subset.mean()
@@ -425,6 +429,12 @@ def run_sensitivity_analysis(asset_returns_only, asset_names, rf_annual, lookbac
         tangency_result = optimize_tangency(mean_daily_returns, cov_matrix, tuple(asset_names), rf_annual)
 
         if not gmv_result.success or not tangency_result.success:
+            failure_reason = []
+            if not gmv_result.success:
+                failure_reason.append("GMV failed")
+            if not tangency_result.success:
+                failure_reason.append("Tangency failed")
+            failed_windows.append(f"{label} ({', '.join(failure_reason)})")
             continue
 
         gmv_weights = gmv_result.x
@@ -465,7 +475,7 @@ def run_sensitivity_analysis(asset_returns_only, asset_names, rf_annual, lookbac
     results_df = pd.DataFrame(results)
     weights_df = pd.DataFrame(weights_rows)
 
-    return results_df, weights_df
+    return results_df, weights_df, failed_windows
 
 
 # =========================================================
@@ -624,145 +634,146 @@ if st.session_state.analysis_ready:
         custom_weights = raw_custom_weights / raw_custom_weights.sum()
 
     # -------------------------
-    # Core portfolios
+    # Core portfolios and optimization
     # -------------------------
-    eq_summary = build_portfolio_summary(
-        asset_returns_only,
-        mean_daily_returns,
-        cov_matrix,
-        eq_weights,
-        rf_annual,
-        "Equal Weight"
-    )
+    with st.spinner("Running portfolio optimization..."):
+        eq_summary = build_portfolio_summary(
+            asset_returns_only,
+            mean_daily_returns,
+            cov_matrix,
+            eq_weights,
+            rf_annual,
+            "Equal Weight"
+        )
 
-    gmv_result = optimize_gmv(mean_daily_returns, cov_matrix, tuple(user_assets))
-    tangency_result = optimize_tangency(mean_daily_returns, cov_matrix, tuple(user_assets), rf_annual)
+        gmv_result = optimize_gmv(mean_daily_returns, cov_matrix, tuple(user_assets))
+        tangency_result = optimize_tangency(mean_daily_returns, cov_matrix, tuple(user_assets), rf_annual)
 
-    if not gmv_result.success:
-        st.error("Global Minimum Variance optimization failed.")
-        st.stop()
+        if not gmv_result.success:
+            st.error("Global Minimum Variance optimization failed.")
+            st.stop()
 
-    if not tangency_result.success:
-        st.error("Tangency portfolio optimization failed.")
-        st.stop()
+        if not tangency_result.success:
+            st.error("Tangency portfolio optimization failed.")
+            st.stop()
 
-    gmv_weights = gmv_result.x
-    tangency_weights = tangency_result.x
+        gmv_weights = gmv_result.x
+        tangency_weights = tangency_result.x
 
-    gmv_summary = build_portfolio_summary(
-        asset_returns_only,
-        mean_daily_returns,
-        cov_matrix,
-        gmv_weights,
-        rf_annual,
-        "GMV"
-    )
+        gmv_summary = build_portfolio_summary(
+            asset_returns_only,
+            mean_daily_returns,
+            cov_matrix,
+            gmv_weights,
+            rf_annual,
+            "GMV"
+        )
 
-    tangency_summary = build_portfolio_summary(
-        asset_returns_only,
-        mean_daily_returns,
-        cov_matrix,
-        tangency_weights,
-        rf_annual,
-        "Tangency"
-    )
+        tangency_summary = build_portfolio_summary(
+            asset_returns_only,
+            mean_daily_returns,
+            cov_matrix,
+            tangency_weights,
+            rf_annual,
+            "Tangency"
+        )
 
-    custom_summary = build_portfolio_summary(
-        asset_returns_only,
-        mean_daily_returns,
-        cov_matrix,
-        custom_weights,
-        rf_annual,
-        "Custom"
-    )
+        custom_summary = build_portfolio_summary(
+            asset_returns_only,
+            mean_daily_returns,
+            cov_matrix,
+            custom_weights,
+            rf_annual,
+            "Custom"
+        )
 
-    benchmark_max_dd = compute_drawdown(returns[BENCHMARK])[1]
-    benchmark_summary = pd.Series({
-        "Portfolio": "S&P 500",
-        "Annualized Return": returns[BENCHMARK].mean() * TRADING_DAYS,
-        "Annualized Volatility": returns[BENCHMARK].std() * np.sqrt(TRADING_DAYS),
-        "Sharpe Ratio": metrics_df.loc[BENCHMARK, "Sharpe Ratio"],
-        "Sortino Ratio": metrics_df.loc[BENCHMARK, "Sortino Ratio"],
-        "Maximum Drawdown": benchmark_max_dd
-    })
+        benchmark_max_dd = compute_drawdown(returns[BENCHMARK])[1]
+        benchmark_summary = pd.Series({
+            "Portfolio": "S&P 500",
+            "Annualized Return": returns[BENCHMARK].mean() * TRADING_DAYS,
+            "Annualized Volatility": returns[BENCHMARK].std() * np.sqrt(TRADING_DAYS),
+            "Sharpe Ratio": metrics_df.loc[BENCHMARK, "Sharpe Ratio"],
+            "Sortino Ratio": metrics_df.loc[BENCHMARK, "Sortino Ratio"],
+            "Maximum Drawdown": benchmark_max_dd
+        })
 
-    portfolio_summary_df = pd.DataFrame(
-        [eq_summary, gmv_summary, tangency_summary, custom_summary, benchmark_summary]
-    ).set_index("Portfolio")
+        portfolio_summary_df = pd.DataFrame(
+            [eq_summary, gmv_summary, tangency_summary, custom_summary, benchmark_summary]
+        ).set_index("Portfolio")
 
-    weights_df = make_weights_df(user_assets, eq_weights, gmv_weights, tangency_weights, custom_weights)
+        weights_df = make_weights_df(user_assets, eq_weights, gmv_weights, tangency_weights, custom_weights)
 
-    # -------------------------
-    # Risk contribution
-    # -------------------------
-    gmv_rc = risk_contribution(gmv_weights, cov_matrix)
-    tangency_rc = risk_contribution(tangency_weights, cov_matrix)
+        # -------------------------
+        # Risk contribution
+        # -------------------------
+        gmv_rc = risk_contribution(gmv_weights, cov_matrix)
+        tangency_rc = risk_contribution(tangency_weights, cov_matrix)
 
-    gmv_rc_df = pd.DataFrame({
-        "Asset": user_assets,
-        "Weight": gmv_weights,
-        "Risk Contribution": gmv_rc
-    })
+        gmv_rc_df = pd.DataFrame({
+            "Asset": user_assets,
+            "Weight": gmv_weights,
+            "Risk Contribution": gmv_rc
+        })
 
-    tangency_rc_df = pd.DataFrame({
-        "Asset": user_assets,
-        "Weight": tangency_weights,
-        "Risk Contribution": tangency_rc
-    })
+        tangency_rc_df = pd.DataFrame({
+            "Asset": user_assets,
+            "Weight": tangency_weights,
+            "Risk Contribution": tangency_rc
+        })
 
-    # -------------------------
-    # Efficient frontier
-    # -------------------------
-    frontier_df = efficient_frontier_points(mean_daily_returns, cov_matrix, n_points=40)
+        # -------------------------
+        # Efficient frontier
+        # -------------------------
+        frontier_df = efficient_frontier_points(mean_daily_returns, cov_matrix, n_points=40)
 
-    eq_vol = portfolio_annual_volatility(eq_weights, cov_matrix)
-    eq_ret = portfolio_annual_return(eq_weights, mean_daily_returns)
+        eq_vol = portfolio_annual_volatility(eq_weights, cov_matrix)
+        eq_ret = portfolio_annual_return(eq_weights, mean_daily_returns)
 
-    gmv_vol = portfolio_annual_volatility(gmv_weights, cov_matrix)
-    gmv_ret = portfolio_annual_return(gmv_weights, mean_daily_returns)
+        gmv_vol = portfolio_annual_volatility(gmv_weights, cov_matrix)
+        gmv_ret = portfolio_annual_return(gmv_weights, mean_daily_returns)
 
-    tangency_vol = portfolio_annual_volatility(tangency_weights, cov_matrix)
-    tangency_ret = portfolio_annual_return(tangency_weights, mean_daily_returns)
+        tangency_vol = portfolio_annual_volatility(tangency_weights, cov_matrix)
+        tangency_ret = portfolio_annual_return(tangency_weights, mean_daily_returns)
 
-    custom_vol = portfolio_annual_volatility(custom_weights, cov_matrix)
-    custom_ret = portfolio_annual_return(custom_weights, mean_daily_returns)
+        custom_vol = portfolio_annual_volatility(custom_weights, cov_matrix)
+        custom_ret = portfolio_annual_return(custom_weights, mean_daily_returns)
 
-    benchmark_vol = returns[BENCHMARK].std() * np.sqrt(TRADING_DAYS)
-    benchmark_ret = returns[BENCHMARK].mean() * TRADING_DAYS
+        benchmark_vol = returns[BENCHMARK].std() * np.sqrt(TRADING_DAYS)
+        benchmark_ret = returns[BENCHMARK].mean() * TRADING_DAYS
 
-    max_frontier_vol = max(
-        frontier_df["Volatility"].max() if not frontier_df.empty else 0,
-        tangency_vol,
-        custom_vol,
-        benchmark_vol
-    )
-    cal_x = np.linspace(0, max_frontier_vol * 1.2, 100)
-    tangency_slope = (tangency_ret - rf_annual) / tangency_vol if tangency_vol != 0 else 0
-    cal_y = rf_annual + tangency_slope * cal_x
+        max_frontier_vol = max(
+            frontier_df["Volatility"].max() if not frontier_df.empty else 0,
+            tangency_vol,
+            custom_vol,
+            benchmark_vol
+        )
+        cal_x = np.linspace(0, max_frontier_vol * 1.2, 100)
+        tangency_slope = (tangency_ret - rf_annual) / tangency_vol if tangency_vol != 0 else 0
+        cal_y = rf_annual + tangency_slope * cal_x
 
-    # -------------------------
-    # Portfolio wealth comparison
-    # -------------------------
-    portfolio_return_series = pd.DataFrame({
-        "Equal Weight": portfolio_daily_returns(asset_returns_only, eq_weights),
-        "GMV": portfolio_daily_returns(asset_returns_only, gmv_weights),
-        "Tangency": portfolio_daily_returns(asset_returns_only, tangency_weights),
-        "Custom": portfolio_daily_returns(asset_returns_only, custom_weights),
-        "S&P 500": returns[BENCHMARK]
-    })
+        # -------------------------
+        # Portfolio wealth comparison
+        # -------------------------
+        portfolio_return_series = pd.DataFrame({
+            "Equal Weight": portfolio_daily_returns(asset_returns_only, eq_weights),
+            "GMV": portfolio_daily_returns(asset_returns_only, gmv_weights),
+            "Tangency": portfolio_daily_returns(asset_returns_only, tangency_weights),
+            "Custom": portfolio_daily_returns(asset_returns_only, custom_weights),
+            "S&P 500": returns[BENCHMARK]
+        })
 
-    portfolio_wealth_df = cumulative_wealth(portfolio_return_series, initial_wealth=10000)
+        portfolio_wealth_df = cumulative_wealth(portfolio_return_series, initial_wealth=10000)
 
-    # -------------------------
-    # Sensitivity analysis
-    # -------------------------
-    lookback_options = get_lookback_options(asset_returns_only.index)
-    sensitivity_results_df, sensitivity_weights_df = run_sensitivity_analysis(
-        asset_returns_only,
-        user_assets,
-        rf_annual,
-        lookback_options
-    )
+        # -------------------------
+        # Sensitivity analysis
+        # -------------------------
+        lookback_options = get_lookback_options(asset_returns_only.index)
+        sensitivity_results_df, sensitivity_weights_df, failed_windows = run_sensitivity_analysis(
+            asset_returns_only,
+            tuple(user_assets),
+            rf_annual,
+            lookback_options
+        )
 
     # Tabs
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -1076,9 +1087,10 @@ This section compares:
         st.subheader("Risk Contribution")
         st.markdown(
             """
-Risk contribution shows how much each stock contributes to total portfolio volatility.
-A stock can have a small weight but still contribute a large share of risk if it is especially volatile
-or strongly linked to the rest of the portfolio.
+Risk contribution shows how much each asset contributes to total portfolio volatility.
+
+For example, a stock with 10% weight but 25% risk contribution is a disproportionate
+source of risk in the portfolio.
 """
         )
 
@@ -1209,7 +1221,7 @@ which is the highest-Sharpe risky portfolio.
         )
         st.plotly_chart(fig_portfolio_wealth, use_container_width=True)
 
-        # =====================================================
+    # =====================================================
     # TAB 6: SENSITIVITY ANALYSIS
     # =====================================================
     with tab6:
@@ -1226,6 +1238,12 @@ This section compares GMV and Tangency portfolios across multiple valid lookback
 
         available_windows_text = ", ".join(list(lookback_options.keys()))
         st.info(f"Available lookback windows based on your selected data range: {available_windows_text}")
+
+        if failed_windows:
+            st.warning(
+                "Sensitivity analysis could not be computed for these windows: "
+                + ", ".join(failed_windows)
+            )
 
         if sensitivity_results_df.empty:
             st.warning("Sensitivity analysis could not be computed for the available lookback windows.")
@@ -1290,4 +1308,5 @@ This section compares GMV and Tangency portfolios across multiple valid lookback
                 use_container_width=True
             )
 
-st.info("Enter your portfolio inputs in the sidebar and click Run Analysis.")
+else:
+    st.info("Enter your portfolio inputs in the sidebar and click Run Analysis.")
