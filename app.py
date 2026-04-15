@@ -7,23 +7,23 @@ import plotly.graph_objects as go
 from scipy.stats import skew, kurtosis, norm, probplot
 from datetime import date, timedelta
 
-# -----------------------------
-# Page config
-# -----------------------------
+# =========================================================
+# PAGE CONFIG
+# =========================================================
 st.set_page_config(
-    page_title="Interactive Portfolio Analytics App",
+    page_title="Interactive Portfolio Analytics Application",
     layout="wide"
 )
 
-# -----------------------------
-# Constants
-# -----------------------------
+# =========================================================
+# CONSTANTS
+# =========================================================
 TRADING_DAYS = 252
 BENCHMARK = "^GSPC"
 
-# -----------------------------
-# Session state setup
-# -----------------------------
+# =========================================================
+# SESSION STATE
+# =========================================================
 if "analysis_ready" not in st.session_state:
     st.session_state.analysis_ready = False
 
@@ -39,56 +39,95 @@ if "stored_end_date" not in st.session_state:
 if "stored_rf_annual" not in st.session_state:
     st.session_state.stored_rf_annual = None
 
+# =========================================================
+# HELPER FUNCTIONS
+# =========================================================
+def validate_ticker_input(ticker_text):
+    raw_tickers = [t.strip().upper() for t in ticker_text.split(",")]
+    tickers = [t for t in raw_tickers if t]
 
-# -----------------------------
-# Helper functions
-# -----------------------------
+    if len(tickers) < 3:
+        return None, "Please enter at least 3 ticker symbols."
+    if len(tickers) > 10:
+        return None, "Please enter no more than 10 ticker symbols."
+
+    unique_tickers = list(dict.fromkeys(tickers))
+    if len(unique_tickers) < 3:
+        return None, "Please enter at least 3 unique ticker symbols."
+
+    return unique_tickers, None
+
+
 @st.cache_data(ttl=3600)
 def download_price_data(tickers, start_date, end_date):
+    """
+    Download adjusted close prices safely for user tickers + benchmark.
+    Handles different yfinance output shapes and partial-data issues.
+    """
     all_tickers = list(dict.fromkeys(tickers + [BENCHMARK]))
 
     try:
         raw = yf.download(
-            all_tickers,
+            tickers=all_tickers,
             start=start_date,
             end=end_date,
+            progress=False,
             auto_adjust=False,
-            progress=False
+            group_by="column",
+            threads=True
         )
     except Exception as e:
         raise RuntimeError(f"Data download failed: {e}")
 
-    if raw.empty:
-        raise RuntimeError("No data was downloaded. Check the ticker symbols and date range.")
+    if raw is None or raw.empty:
+        raise RuntimeError("No data was downloaded. Check your tickers and date range.")
 
-    if "Adj Close" in raw.columns:
-        prices = raw["Adj Close"].copy()
-    else:
-        if "Close" in raw.columns:
+    prices = None
+
+    # Common multi-index format
+    if isinstance(raw.columns, pd.MultiIndex):
+        level0 = [str(x) for x in raw.columns.get_level_values(0)]
+        if "Adj Close" in level0:
+            prices = raw["Adj Close"].copy()
+        elif "Close" in level0:
             prices = raw["Close"].copy()
-        else:
-            raise RuntimeError("Adjusted close prices were not available from yfinance.")
+
+    # Single-index fallback
+    else:
+        if "Adj Close" in raw.columns:
+            prices = raw[["Adj Close"]].copy()
+            # if only one ticker, rename to that ticker
+            if len(all_tickers) == 1:
+                prices.columns = [all_tickers[0]]
+        elif "Close" in raw.columns:
+            prices = raw[["Close"]].copy()
+            if len(all_tickers) == 1:
+                prices.columns = [all_tickers[0]]
+
+    if prices is None:
+        raise RuntimeError(
+            "Could not find adjusted close or close prices in the yfinance download output."
+        )
 
     if isinstance(prices, pd.Series):
-        prices = prices.to_frame(name=all_tickers[0])
+        prices = prices.to_frame()
 
     prices = prices.sort_index()
+
+    # Make sure columns are ticker names
+    prices.columns = [str(col) for col in prices.columns]
 
     invalid_tickers = []
     for ticker in all_tickers:
         if ticker not in prices.columns:
-            invalid_tickers.append(ticker)
-
-    for col in prices.columns:
-        if prices[col].dropna().empty:
-            invalid_tickers.append(col)
-
-    invalid_tickers = list(set([t for t in invalid_tickers if t != BENCHMARK]))
+            if ticker != BENCHMARK:
+                invalid_tickers.append(ticker)
+        elif prices[ticker].dropna().empty:
+            if ticker != BENCHMARK:
+                invalid_tickers.append(ticker)
 
     if BENCHMARK not in prices.columns or prices[BENCHMARK].dropna().empty:
         raise RuntimeError("Benchmark (^GSPC) failed to download properly.")
-
-    benchmark_prices = prices[[BENCHMARK]].copy()
 
     valid_user_cols = [
         col for col in prices.columns
@@ -102,8 +141,9 @@ def download_price_data(tickers, start_date, end_date):
 
     working = prices[valid_user_cols + [BENCHMARK]].copy()
 
-    user_missing_pct = working[valid_user_cols].isna().mean()
-    dropped_tickers = user_missing_pct[user_missing_pct > 0.05].index.tolist()
+    # Drop tickers with >5% missing values
+    missing_pct = working[valid_user_cols].isna().mean()
+    dropped_tickers = missing_pct[missing_pct > 0.05].index.tolist()
 
     if dropped_tickers:
         valid_user_cols = [t for t in valid_user_cols if t not in dropped_tickers]
@@ -114,9 +154,9 @@ def download_price_data(tickers, start_date, end_date):
             f"Remaining tickers: {valid_user_cols}"
         )
 
-    working = working[valid_user_cols + [BENCHMARK]].copy()
+    working = prices[valid_user_cols + [BENCHMARK]].copy()
 
-    overlap_note = None
+    # Truncate to overlapping date range
     overlap_start = working.apply(lambda col: col.first_valid_index()).max()
     overlap_end = working.apply(lambda col: col.last_valid_index()).min()
 
@@ -126,6 +166,7 @@ def download_price_data(tickers, start_date, end_date):
     original_start = pd.to_datetime(start_date)
     original_end = pd.to_datetime(end_date)
 
+    overlap_note = None
     if overlap_start > original_start or overlap_end < original_end:
         overlap_note = (
             f"Data was truncated to the overlapping date range: "
@@ -137,7 +178,7 @@ def download_price_data(tickers, start_date, end_date):
     if working.empty:
         raise RuntimeError("No aligned price data remained after cleaning.")
 
-    return working, benchmark_prices, invalid_tickers, dropped_tickers, overlap_note
+    return working, invalid_tickers, dropped_tickers, overlap_note
 
 
 @st.cache_data(ttl=3600)
@@ -183,14 +224,12 @@ def risk_adjusted_metrics(returns, rf_annual):
     ann_return = returns.mean() * TRADING_DAYS
     ann_vol = returns.std() * np.sqrt(TRADING_DAYS)
 
-    excess_daily = returns.subtract(rf_daily)
-    sharpe = (excess_daily.mean() / returns.std()) * np.sqrt(TRADING_DAYS)
+    sharpe = ((returns - rf_daily).mean() / returns.std()) * np.sqrt(TRADING_DAYS)
 
-    downside = returns.copy()
-    downside = downside.subtract(rf_daily)
-    downside = downside.where(downside < 0, 0)
+    downside_excess = returns - rf_daily
+    downside_excess = downside_excess.where(downside_excess < 0, 0)
 
-    downside_dev = np.sqrt((downside ** 2).mean()) * np.sqrt(TRADING_DAYS)
+    downside_dev = np.sqrt((downside_excess ** 2).mean()) * np.sqrt(TRADING_DAYS)
     sortino = (ann_return - rf_annual) / downside_dev.replace(0, np.nan)
 
     metrics = pd.DataFrame({
@@ -203,39 +242,25 @@ def risk_adjusted_metrics(returns, rf_annual):
     return metrics
 
 
-def validate_ticker_input(ticker_text):
-    raw_tickers = [t.strip().upper() for t in ticker_text.split(",")]
-    tickers = [t for t in raw_tickers if t]
-
-    if len(tickers) < 3:
-        return None, "Please enter at least 3 ticker symbols."
-    if len(tickers) > 10:
-        return None, "Please enter no more than 10 ticker symbols."
-
-    unique_tickers = list(dict.fromkeys(tickers))
-    if len(unique_tickers) < 3:
-        return None, "Please enter at least 3 unique ticker symbols."
-
-    return unique_tickers, None
-
-
-# -----------------------------
-# App title / intro
-# -----------------------------
+# =========================================================
+# TITLE / INTRO
+# =========================================================
 st.title("Interactive Portfolio Analytics Application")
 st.markdown(
     """
-    Build and analyze stock portfolios with return, risk, and exploratory analytics.
-    This version currently includes:
-    - User input and data retrieval
-    - Return computation and exploratory analysis
-    - Risk analysis
-    """
+Build and analyze stock portfolios with return, risk, and exploratory analytics.
+
+This version currently includes:
+- User input and data retrieval
+- Return computation and exploratory analysis
+- Risk analysis
+- Correlation analysis
+"""
 )
 
-# -----------------------------
-# Sidebar inputs
-# -----------------------------
+# =========================================================
+# SIDEBAR INPUTS
+# =========================================================
 st.sidebar.header("Portfolio Inputs")
 
 default_start = date.today() - timedelta(days=365 * 5)
@@ -258,9 +283,23 @@ rf_percent = st.sidebar.number_input(
 )
 rf_annual = rf_percent / 100.0
 
-# -----------------------------
-# Run button logic
-# -----------------------------
+with st.sidebar.expander("About / Methodology"):
+    st.markdown(
+        """
+- **Data source:** yfinance adjusted close prices
+- **Return type:** simple daily returns
+- **Annualized return:** mean daily return × 252
+- **Annualized volatility:** daily standard deviation × √252
+- **Risk-free rate:** annual input divided by 252 where needed
+- **Sharpe ratio:** excess return over total volatility
+- **Sortino ratio:** excess return over downside deviation
+- **Cumulative wealth:** $10,000 × (1 + returns).cumprod()
+"""
+    )
+
+# =========================================================
+# RUN BUTTON LOGIC
+# =========================================================
 if st.sidebar.button("Run Analysis", type="primary"):
     tickers, error_msg = validate_ticker_input(ticker_text)
 
@@ -285,9 +324,9 @@ if st.sidebar.button("Run Analysis", type="primary"):
     st.session_state.stored_end_date = end_date
     st.session_state.stored_rf_annual = rf_annual
 
-# -----------------------------
-# Main app logic
-# -----------------------------
+# =========================================================
+# MAIN APP
+# =========================================================
 if st.session_state.analysis_ready:
     tickers = st.session_state.stored_tickers
     start_date = st.session_state.stored_start_date
@@ -296,34 +335,46 @@ if st.session_state.analysis_ready:
 
     with st.spinner("Downloading and processing market data..."):
         try:
-            prices, benchmark_prices, invalid_tickers, dropped_tickers, overlap_note = download_price_data(
+            prices, invalid_tickers, dropped_tickers, overlap_note = download_price_data(
                 tickers, start_date, end_date
             )
+
             returns = compute_returns(prices)
             stats_df = summary_statistics(returns)
             wealth = cumulative_wealth(returns)
             metrics_df = risk_adjusted_metrics(returns, rf_annual)
+
         except Exception as e:
             st.error(f"Error: {e}")
             st.stop()
 
     if invalid_tickers:
-        st.warning(f"These tickers failed to download or had insufficient data: {', '.join(invalid_tickers)}")
+        st.warning(
+            f"These tickers failed to download or had insufficient data: {', '.join(invalid_tickers)}"
+        )
 
     if dropped_tickers:
-        st.warning(f"These tickers were dropped because they had more than 5% missing values: {', '.join(dropped_tickers)}")
+        st.warning(
+            f"These tickers were dropped because they had more than 5% missing values: {', '.join(dropped_tickers)}"
+        )
 
     if overlap_note:
         st.info(overlap_note)
 
     user_assets = [col for col in prices.columns if col != BENCHMARK]
+    corr_matrix = returns[user_assets].corr()
+    cov_matrix = returns[user_assets].cov()
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "Data Overview",
         "Return Analysis",
-        "Risk Analysis"
+        "Risk Analysis",
+        "Correlation Analysis"
     ])
 
+    # =====================================================
+    # TAB 1: DATA OVERVIEW
+    # =====================================================
     with tab1:
         st.subheader("Cleaned Price Data")
         st.dataframe(prices.tail(), use_container_width=True)
@@ -331,16 +382,20 @@ if st.session_state.analysis_ready:
         st.subheader("Daily Return Data")
         st.dataframe(returns.tail(), use_container_width=True)
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Number of Assets", len(user_assets))
-        col2.metric("Observations", len(prices))
-        col3.metric("Benchmark", BENCHMARK)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Number of Assets", len(user_assets))
+        c2.metric("Observations", len(prices))
+        c3.metric("Benchmark", BENCHMARK)
 
+    # =====================================================
+    # TAB 2: RETURN ANALYSIS
+    # =====================================================
     with tab2:
         st.subheader("Summary Statistics")
         st.dataframe(stats_df.style.format("{:.4f}"), use_container_width=True)
 
         st.subheader("Cumulative Wealth Index")
+
         selected_series = st.multiselect(
             "Select assets to display",
             options=list(wealth.columns),
@@ -435,6 +490,9 @@ if st.session_state.analysis_ready:
             )
             st.plotly_chart(qq_fig, use_container_width=True)
 
+    # =====================================================
+    # TAB 3: RISK ANALYSIS
+    # =====================================================
     with tab3:
         st.subheader("Rolling Annualized Volatility")
 
@@ -479,6 +537,70 @@ if st.session_state.analysis_ready:
 
         st.subheader("Risk-Adjusted Metrics")
         st.dataframe(metrics_df.style.format("{:.4f}"), use_container_width=True)
+
+    # =====================================================
+    # TAB 4: CORRELATION ANALYSIS
+    # =====================================================
+    with tab4:
+        st.subheader("Correlation Heatmap")
+
+        heatmap_fig = px.imshow(
+            corr_matrix,
+            text_auto=".2f",
+            color_continuous_scale="RdBu_r",
+            zmin=-1,
+            zmax=1,
+            aspect="auto",
+            title="Pairwise Correlation Matrix of Daily Returns"
+        )
+        heatmap_fig.update_layout(
+            xaxis_title="Assets",
+            yaxis_title="Assets",
+            coloraxis_colorbar_title="Correlation"
+        )
+        st.plotly_chart(heatmap_fig, use_container_width=True)
+
+        st.subheader("Rolling Correlation")
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            stock_1 = st.selectbox(
+                "Select first stock",
+                options=user_assets,
+                key="rolling_corr_stock_1"
+            )
+
+        with col2:
+            stock_2_options = [ticker for ticker in user_assets if ticker != stock_1]
+            stock_2 = st.selectbox(
+                "Select second stock",
+                options=stock_2_options,
+                key="rolling_corr_stock_2"
+            )
+
+        with col3:
+            corr_window = st.select_slider(
+                "Select rolling window",
+                options=[30, 60, 90, 120],
+                value=60,
+                key="rolling_corr_window"
+            )
+
+        rolling_corr_series = returns[stock_1].rolling(corr_window).corr(returns[stock_2])
+
+        rolling_corr_fig = px.line(
+            x=rolling_corr_series.index,
+            y=rolling_corr_series.values,
+            title=f"Rolling Correlation: {stock_1} vs {stock_2} ({corr_window}-Day Window)",
+            labels={"x": "Date", "y": "Correlation"}
+        )
+        rolling_corr_fig.update_yaxes(range=[-1, 1])
+        st.plotly_chart(rolling_corr_fig, use_container_width=True)
+
+        with st.expander("Show Covariance Matrix"):
+            st.subheader("Covariance Matrix of Daily Returns")
+            st.dataframe(cov_matrix.style.format("{:.6f}"), use_container_width=True)
 
 else:
     st.info("Enter your portfolio inputs in the sidebar and click Run Analysis.")
