@@ -506,7 +506,7 @@ default_end = date.today()
 
 ticker_text = st.sidebar.text_input(
     "Enter 3 to 10 stock tickers (comma-separated)",
-    value="AAPL, MSFT, NVDA, AMZN"
+    value="AAPL, MSFT, NVDA, TSLA"
 )
 
 start_date = st.sidebar.date_input("Start Date", value=default_start)
