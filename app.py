@@ -1209,7 +1209,7 @@ which is the highest-Sharpe risky portfolio.
         )
         st.plotly_chart(fig_portfolio_wealth, use_container_width=True)
 
-    # =====================================================
+        # =====================================================
     # TAB 6: SENSITIVITY ANALYSIS
     # =====================================================
     with tab6:
@@ -1218,7 +1218,8 @@ which is the highest-Sharpe risky portfolio.
         st.markdown(
             """
 Mean-variance optimization is sensitive to its inputs. Small changes in the historical sample
-used to estimate returns and covariances can lead to very different portfolio weights and outcomes.
+used to estimate expected returns and covariances can produce very different optimal weights.
+That matters because historical optimization results are only as stable as the inputs that produced them.
 This section compares GMV and Tangency portfolios across multiple valid lookback windows.
 """
         )
@@ -1266,20 +1267,27 @@ This section compares GMV and Tangency portfolios across multiple valid lookback
                 )
                 fig_sensitivity_weights.update_yaxes(tickformat=".0%")
                 st.plotly_chart(fig_sensitivity_weights, use_container_width=True)
+            else:
+                st.warning(f"No {portfolio_choice} weights were available for the selected lookback windows.")
 
             st.subheader("Detailed Sensitivity Weights Table")
 
-weights_pivot = sensitivity_weights_df.pivot_table(
-    index=["Portfolio", "Window"],
-    columns="Asset",
-    values="Weight"
-).reset_index()
+            weights_pivot = sensitivity_weights_df.pivot_table(
+                index=["Portfolio", "Window"],
+                columns="Asset",
+                values="Weight"
+            ).reset_index()
 
-numeric_weight_cols = [col for col in weights_pivot.columns if col not in ["Portfolio", "Window"]]
+            numeric_weight_cols = [
+                col for col in weights_pivot.columns
+                if col not in ["Portfolio", "Window"]
+            ]
 
-st.dataframe(
-    weights_pivot.style.format({col: "{:.2%}" for col in numeric_weight_cols}),
-    use_container_width=True
-    ) 
+            st.dataframe(
+                weights_pivot.style.format(
+                    {col: "{:.2%}" for col in numeric_weight_cols}
+                ),
+                use_container_width=True
+            )
 
 st.info("Enter your portfolio inputs in the sidebar and click Run Analysis.")
