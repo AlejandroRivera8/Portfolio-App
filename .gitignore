@@ -5,6 +5,9 @@ build/
 dist/
 wheels/
 *.egg-info
+.python-version
+Thumbs.db
+.streamlit/
 
 # Virtual environments
 .venv
