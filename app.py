@@ -5,6 +5,7 @@ import yfinance as yf
 import plotly.express as px
 import plotly.graph_objects as go
 from scipy.stats import skew, kurtosis, norm, probplot
+from scipy.optimize import minimize
 from datetime import date, timedelta
 
 # =========================================================
@@ -84,19 +85,15 @@ def download_price_data(tickers, start_date, end_date):
 
     prices = None
 
-    # Common multi-index format
     if isinstance(raw.columns, pd.MultiIndex):
         level0 = [str(x) for x in raw.columns.get_level_values(0)]
         if "Adj Close" in level0:
             prices = raw["Adj Close"].copy()
         elif "Close" in level0:
             prices = raw["Close"].copy()
-
-    # Single-index fallback
     else:
         if "Adj Close" in raw.columns:
             prices = raw[["Adj Close"]].copy()
-            # if only one ticker, rename to that ticker
             if len(all_tickers) == 1:
                 prices.columns = [all_tickers[0]]
         elif "Close" in raw.columns:
@@ -113,8 +110,6 @@ def download_price_data(tickers, start_date, end_date):
         prices = prices.to_frame()
 
     prices = prices.sort_index()
-
-    # Make sure columns are ticker names
     prices.columns = [str(col) for col in prices.columns]
 
     invalid_tickers = []
@@ -141,7 +136,6 @@ def download_price_data(tickers, start_date, end_date):
 
     working = prices[valid_user_cols + [BENCHMARK]].copy()
 
-    # Drop tickers with >5% missing values
     missing_pct = working[valid_user_cols].isna().mean()
     dropped_tickers = missing_pct[missing_pct > 0.05].index.tolist()
 
@@ -156,7 +150,6 @@ def download_price_data(tickers, start_date, end_date):
 
     working = prices[valid_user_cols + [BENCHMARK]].copy()
 
-    # Truncate to overlapping date range
     overlap_start = working.apply(lambda col: col.first_valid_index()).max()
     overlap_end = working.apply(lambda col: col.last_valid_index()).min()
 
@@ -242,6 +235,133 @@ def risk_adjusted_metrics(returns, rf_annual):
     return metrics
 
 
+@st.cache_data(ttl=3600)
+def portfolio_annual_return(weights, mean_daily_returns):
+    return np.sum(weights * mean_daily_returns) * TRADING_DAYS
+
+
+@st.cache_data(ttl=3600)
+def portfolio_annual_volatility(weights, cov_matrix_daily):
+    cov_annual = cov_matrix_daily * TRADING_DAYS
+    return np.sqrt(weights.T @ cov_annual @ weights)
+
+
+@st.cache_data(ttl=3600)
+def portfolio_daily_returns(asset_returns, weights):
+    return asset_returns @ weights
+
+
+@st.cache_data(ttl=3600)
+def portfolio_sortino_ratio(asset_returns, weights, rf_annual):
+    rf_daily = rf_annual / TRADING_DAYS
+    p_returns = portfolio_daily_returns(asset_returns, weights)
+
+    ann_return = p_returns.mean() * TRADING_DAYS
+    downside_excess = p_returns - rf_daily
+    downside_excess = np.where(downside_excess < 0, downside_excess, 0)
+
+    downside_dev = np.sqrt(np.mean(downside_excess ** 2)) * np.sqrt(TRADING_DAYS)
+
+    if downside_dev == 0:
+        return np.nan
+
+    return (ann_return - rf_annual) / downside_dev
+
+
+@st.cache_data(ttl=3600)
+def portfolio_max_drawdown(asset_returns, weights):
+    p_returns = portfolio_daily_returns(asset_returns, weights)
+    _, max_dd = compute_drawdown(p_returns)
+    return max_dd
+
+
+def portfolio_sharpe_ratio(weights, mean_daily_returns, cov_matrix_daily, rf_annual):
+    port_return = portfolio_annual_return(weights, mean_daily_returns)
+    port_vol = portfolio_annual_volatility(weights, cov_matrix_daily)
+
+    if port_vol == 0:
+        return np.nan
+
+    return (port_return - rf_annual) / port_vol
+
+
+def negative_sharpe_ratio(weights, mean_daily_returns, cov_matrix_daily, rf_annual):
+    sharpe = portfolio_sharpe_ratio(weights, mean_daily_returns, cov_matrix_daily, rf_annual)
+    if np.isnan(sharpe):
+        return 1e6
+    return -sharpe
+
+
+def portfolio_volatility_objective(weights, cov_matrix_daily):
+    return portfolio_annual_volatility(weights, cov_matrix_daily)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def optimize_gmv(mean_daily_returns, cov_matrix_daily, asset_names):
+    n_assets = len(asset_names)
+    initial_weights = np.array([1 / n_assets] * n_assets)
+
+    bounds = tuple((0.0, 1.0) for _ in range(n_assets))
+    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
+
+    result = minimize(
+        portfolio_volatility_objective,
+        initial_weights,
+        args=(cov_matrix_daily,),
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints
+    )
+
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def optimize_tangency(mean_daily_returns, cov_matrix_daily, asset_names, rf_annual):
+    n_assets = len(asset_names)
+    initial_weights = np.array([1 / n_assets] * n_assets)
+
+    bounds = tuple((0.0, 1.0) for _ in range(n_assets))
+    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
+
+    result = minimize(
+        negative_sharpe_ratio,
+        initial_weights,
+        args=(mean_daily_returns, cov_matrix_daily, rf_annual),
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints
+    )
+
+    return result
+
+
+def build_portfolio_summary(asset_returns, mean_daily_returns, cov_matrix_daily, weights, rf_annual, label):
+    ann_return = portfolio_annual_return(weights, mean_daily_returns)
+    ann_vol = portfolio_annual_volatility(weights, cov_matrix_daily)
+    sharpe = portfolio_sharpe_ratio(weights, mean_daily_returns, cov_matrix_daily, rf_annual)
+    sortino = portfolio_sortino_ratio(asset_returns, weights, rf_annual)
+    max_dd = portfolio_max_drawdown(asset_returns, weights)
+
+    return pd.Series({
+        "Portfolio": label,
+        "Annualized Return": ann_return,
+        "Annualized Volatility": ann_vol,
+        "Sharpe Ratio": sharpe,
+        "Sortino Ratio": sortino,
+        "Maximum Drawdown": max_dd
+    })
+
+
+def make_weights_df(asset_names, eq_weights, gmv_weights, tan_weights):
+    return pd.DataFrame({
+        "Asset": asset_names,
+        "Equal Weight": eq_weights,
+        "GMV Weight": gmv_weights,
+        "Tangency Weight": tan_weights
+    })
+
+
 # =========================================================
 # TITLE / INTRO
 # =========================================================
@@ -255,6 +375,7 @@ This version currently includes:
 - Return computation and exploratory analysis
 - Risk analysis
 - Correlation analysis
+- Portfolio optimization
 """
 )
 
@@ -294,6 +415,7 @@ with st.sidebar.expander("About / Methodology"):
 - **Sharpe ratio:** excess return over total volatility
 - **Sortino ratio:** excess return over downside deviation
 - **Cumulative wealth:** $10,000 × (1 + returns).cumprod()
+- **Optimization constraints:** no short selling, weights between 0 and 1, weights sum to 1
 """
     )
 
@@ -365,11 +487,65 @@ if st.session_state.analysis_ready:
     corr_matrix = returns[user_assets].corr()
     cov_matrix = returns[user_assets].cov()
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    mean_daily_returns = returns[user_assets].mean()
+    asset_returns_only = returns[user_assets]
+
+    n_assets = len(user_assets)
+    eq_weights = np.array([1 / n_assets] * n_assets)
+
+    eq_summary = build_portfolio_summary(
+        asset_returns_only,
+        mean_daily_returns,
+        cov_matrix,
+        eq_weights,
+        rf_annual,
+        "Equal Weight"
+    )
+
+    gmv_result = optimize_gmv(mean_daily_returns, cov_matrix, tuple(user_assets))
+    tangency_result = optimize_tangency(mean_daily_returns, cov_matrix, tuple(user_assets), rf_annual)
+
+    if not gmv_result.success:
+        st.error("Global Minimum Variance optimization failed.")
+        st.stop()
+
+    if not tangency_result.success:
+        st.error("Tangency portfolio optimization failed.")
+        st.stop()
+
+    gmv_weights = gmv_result.x
+    tangency_weights = tangency_result.x
+
+    gmv_summary = build_portfolio_summary(
+        asset_returns_only,
+        mean_daily_returns,
+        cov_matrix,
+        gmv_weights,
+        rf_annual,
+        "GMV"
+    )
+
+    tangency_summary = build_portfolio_summary(
+        asset_returns_only,
+        mean_daily_returns,
+        cov_matrix,
+        tangency_weights,
+        rf_annual,
+        "Tangency"
+    )
+
+    portfolio_summary_df = pd.DataFrame(
+        [eq_summary, gmv_summary, tangency_summary]
+    ).set_index("Portfolio")
+
+    weights_df = make_weights_df(user_assets, eq_weights, gmv_weights, tangency_weights)
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "Data Overview",
         "Return Analysis",
         "Risk Analysis",
-        "Correlation Analysis"
+        "Correlation Analysis",
+        "Portfolio Optimization"
     ])
 
     # =====================================================
@@ -601,6 +777,51 @@ if st.session_state.analysis_ready:
         with st.expander("Show Covariance Matrix"):
             st.subheader("Covariance Matrix of Daily Returns")
             st.dataframe(cov_matrix.style.format("{:.6f}"), use_container_width=True)
+
+    # =====================================================
+    # TAB 5: PORTFOLIO OPTIMIZATION
+    # =====================================================
+    with tab5:
+        st.subheader("Portfolio Summary")
+
+        st.markdown(
+            """
+This section compares three portfolios:
+- **Equal Weight:** allocates the same weight to each stock
+- **GMV (Global Minimum Variance):** minimizes portfolio volatility
+- **Tangency:** maximizes the Sharpe ratio
+"""
+        )
+
+        st.dataframe(portfolio_summary_df.style.format("{:.4f}"), use_container_width=True)
+
+        st.subheader("Portfolio Weights Table")
+        st.dataframe(weights_df.style.format({
+            "Equal Weight": "{:.2%}",
+            "GMV Weight": "{:.2%}",
+            "Tangency Weight": "{:.2%}"
+        }), use_container_width=True)
+
+        st.subheader("Portfolio Weights Chart")
+
+        weights_plot_df = weights_df.melt(
+            id_vars="Asset",
+            value_vars=["Equal Weight", "GMV Weight", "Tangency Weight"],
+            var_name="Portfolio",
+            value_name="Weight"
+        )
+
+        fig_weights = px.bar(
+            weights_plot_df,
+            x="Asset",
+            y="Weight",
+            color="Portfolio",
+            barmode="group",
+            title="Portfolio Weights by Asset",
+            labels={"Weight": "Weight", "Asset": "Asset"}
+        )
+        fig_weights.update_yaxes(tickformat=".0%")
+        st.plotly_chart(fig_weights, use_container_width=True)
 
 else:
     st.info("Enter your portfolio inputs in the sidebar and click Run Analysis.")
